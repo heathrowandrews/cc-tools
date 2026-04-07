@@ -150,12 +150,14 @@ status_from_json() {
 #   done     — Claude finished its turn, your move
 #   stale    — done for >3 min, cooling off (auto-set by cc-snap)
 #   ended    — session closed
+#   reading  — you clicked a dim window, brighten up so you can read it
 #
 bg_color() {
     case "$1" in
         working)  echo "800,2500,1000" ;;      # faint green glow — alive
         approval) echo "3000,1800,400" ;;      # warm amber glow — HEY LOOK
         done)     echo "1200,1200,1500" ;;     # cool dark gray — finished
+        reading)  echo "2200,2200,2800" ;;     # warm charcoal — readable without glare
         stale)    echo "600,600,700" ;;        # near-black — asleep
         ended)    echo "400,400,400" ;;        # void — unplugged
         *)        echo "600,800,600" ;;        # deep dark — idle
@@ -167,6 +169,7 @@ fg_color() {
         working)  echo "0,65535,0" ;;          # BLAZING neon green — Matrix rain
         approval) echo "65535,45000,0" ;;      # hot amber — NEEDS YOU
         done)     echo "18000,24000,18000" ;;  # muted green — readable but receded
+        reading)  echo "38000,42000,38000" ;;  # soft white-green — comfortable reading
         stale)    echo "8000,10000,8000" ;;    # ghostly — barely there
         ended)    echo "3000,3000,3000" ;;     # near-invisible — dead
         *)        echo "5000,8000,5000" ;;     # dim green — sleeping
@@ -179,6 +182,7 @@ bold_color() {
         working)  echo "20000,65535,35000" ;;  # bright mint — pops
         approval) echo "65535,55000,15000" ;;  # bright gold — screams for attention
         done)     echo "22000,30000,22000" ;;  # soft green
+        reading)  echo "48000,52000,48000" ;;  # bright — easy to scan
         stale)    echo "10000,12000,10000" ;;  # faint
         ended)    echo "5000,5000,5000" ;;     # dim
         *)        echo "8000,12000,8000" ;;    # faint green
@@ -191,6 +195,7 @@ cursor_color() {
         working)  echo "0,65535,0" ;;          # neon green — alive and pulsing
         approval) echo "65535,45000,0" ;;      # amber — pulsing for attention
         done)     echo "10000,16000,10000" ;;  # dim green — resting
+        reading)  echo "30000,35000,30000" ;;  # visible — you're here
         stale)    echo "5000,6000,5000" ;;     # barely visible
         ended)    echo "2000,2000,2000" ;;     # nearly invisible
         *)        echo "4000,6000,4000" ;;     # faint
@@ -236,6 +241,24 @@ ansi_block() {
             echo "    set ANSI bright magenta color of t to {60000,45000,20000}"
             echo "    set ANSI bright cyan color of t to {60000,55000,15000}"
             echo "    set ANSI bright white color of t to {65535,60000,35000}"
+            ;;
+        reading)
+            echo "    set ANSI black color of t to {4000,4500,4000}"
+            echo "    set ANSI red color of t to {40000,22000,18000}"
+            echo "    set ANSI green color of t to {22000,42000,22000}"
+            echo "    set ANSI yellow color of t to {40000,40000,18000}"
+            echo "    set ANSI blue color of t to {18000,30000,45000}"
+            echo "    set ANSI magenta color of t to {35000,25000,40000}"
+            echo "    set ANSI cyan color of t to {18000,40000,42000}"
+            echo "    set ANSI white color of t to {42000,45000,42000}"
+            echo "    set ANSI bright black color of t to {12000,14000,12000}"
+            echo "    set ANSI bright red color of t to {50000,30000,25000}"
+            echo "    set ANSI bright green color of t to {30000,50000,30000}"
+            echo "    set ANSI bright yellow color of t to {50000,50000,25000}"
+            echo "    set ANSI bright blue color of t to {25000,40000,55000}"
+            echo "    set ANSI bright magenta color of t to {45000,35000,50000}"
+            echo "    set ANSI bright cyan color of t to {25000,50000,52000}"
+            echo "    set ANSI bright white color of t to {52000,55000,52000}"
             ;;
         stale)
             echo "    set ANSI black color of t to {1500,1500,1500}"
@@ -634,12 +657,18 @@ do_snap() {
             status="stale"
         fi
 
+        # Focus brightening: click a dim window and it lights up to reading mode
+        local visual_status="$status"
+        if [[ "$wid" == "$focused_id" ]] && [[ "$status" == "stale" || "$status" == "ended" || "$status" == "done" || "$status" == "idle" ]]; then
+            visual_status="reading"
+        fi
+
         local bg fg bold curs icon cwd name title
-        bg=$(bg_color "$status")
-        fg=$(fg_color "$status")
-        bold=$(bold_color "$status")
-        curs=$(cursor_color "$status")
-        icon=$(status_icon "$status")
+        bg=$(bg_color "$visual_status")
+        fg=$(fg_color "$visual_status")
+        bold=$(bold_color "$visual_status")
+        curs=$(cursor_color "$visual_status")
+        icon=$(status_icon "$status")  # icon shows real status, not visual
         cwd=$(get_cwd "$wtty")
         name=$(smart_name "$cwd" "$wtty")
         title="${icon} ${name} ${status}${age:+ ${age}}"
@@ -655,7 +684,7 @@ do_snap() {
         if [[ "$full_style" == "true" ]]; then
             as+="    set font name of t to \"Menlo-Regular\""$'\n'
             as+="    set font size of t to 12"$'\n'
-            as+="$(ansi_block "$status")"$'\n'
+            as+="$(ansi_block "$visual_status")"$'\n'
         fi
         as+="  end try"$'\n'
         (( idx++ ))
