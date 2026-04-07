@@ -4,7 +4,7 @@ A command center for running multiple [Claude Code](https://claude.ai/claude-cod
 
 Tiles your Terminal windows into a grid, color-codes them by status (working, waiting for approval, done), and gives you a live dashboard — all automatic.
 
-![Status colors: green = working, cyan = needs approval, gray = done](https://img.shields.io/badge/working-green?style=flat-square) ![](https://img.shields.io/badge/approval-cyan?style=flat-square) ![](https://img.shields.io/badge/done-gray?style=flat-square)
+![](https://img.shields.io/badge/⚡_working-00ff00?style=flat-square) ![](https://img.shields.io/badge/🔶_approval-ff9900?style=flat-square) ![](https://img.shields.io/badge/✓_done-555555?style=flat-square) ![](https://img.shields.io/badge/💤_stale-222222?style=flat-square&labelColor=222222)
 
 ## What it does
 
@@ -16,13 +16,14 @@ Tiles your Terminal windows into a grid, color-codes them by status (working, wa
 
 ### Status colors
 
-| Status | Background | Text | Meaning |
-|--------|-----------|------|---------|
-| **working** | Faint green glow | Neon green | Claude is thinking or running tools |
-| **approval** | Faint cyan glow | Electric cyan | Claude needs you to approve a tool call |
-| **done** | Cool gray | Soft green | Claude finished, waiting for your input |
-| **idle** | Near-black | Ghost green | Session started, no activity yet |
-| **ended** | Void black | Near-invisible | Session closed |
+| Status | Look | Meaning |
+|--------|------|---------|
+| **⚡ working** | Bright neon green on dark green | Claude is thinking or running tools |
+| **🔶 approval** | Hot amber/orange on warm glow | Claude needs you to approve a tool call |
+| **✓ done** | Muted green on dark gray | Claude finished, your move |
+| **💤 stale** | Ghost text on near-black | Done for 3+ minutes, cooling off |
+| **○ idle** | Dim green on dark | Session started, no activity yet |
+| **⊘ ended** | Near-invisible | Session closed |
 
 ## Requirements
 
@@ -57,7 +58,7 @@ Add this to your Claude Code settings (`~/.claude/settings.json`) to enable auto
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "cc-hub-hook approval" }
+          { "type": "command", "command": "cc-hub-hook approval", "timeout": 5000 }
         ]
       }
     ],
@@ -65,7 +66,7 @@ Add this to your Claude Code settings (`~/.claude/settings.json`) to enable auto
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "cc-hub-hook working" }
+          { "type": "command", "command": "cc-hub-hook working", "timeout": 5000 }
         ]
       }
     ],
@@ -73,7 +74,7 @@ Add this to your Claude Code settings (`~/.claude/settings.json`) to enable auto
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "cc-hub-hook done" }
+          { "type": "command", "command": "cc-hub-hook done", "timeout": 5000 }
         ]
       }
     ],
@@ -81,13 +82,37 @@ Add this to your Claude Code settings (`~/.claude/settings.json`) to enable auto
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "cc-hub-hook ended" }
+          { "type": "command", "command": "cc-hub-hook done", "timeout": 5000 }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "cc-hub-hook idle", "timeout": 5000 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "cc-hub-hook ended", "timeout": 5000 }
         ]
       }
     ]
   }
 }
 ```
+
+The hook flow:
+- **PreToolUse → approval**: Flashes amber before each tool. Auto-approved tools flip back to green instantly. Tools needing your OK stay amber until you approve.
+- **PostToolUse → working**: Green glow — Claude is alive and running.
+- **Notification/Stop → done**: Gray — Claude's turn is over, waiting on you.
+- **SessionStart → idle**: Dark — just booted up.
+- **SessionEnd → ended**: Near-invisible — session is gone.
+- **Stale (auto)**: After 3 min of "done", cc-snap auto-dims to near-black. No hook needed.
 
 ## Usage
 
