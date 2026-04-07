@@ -1,0 +1,741 @@
+#!/usr/bin/env bash
+# cc-snap — The one and only Claude Code window manager
+# Tiles windows edge-to-edge, colors by status, leaves names alone.
+# Simple. No fighting. One process.
+
+set -uo pipefail
+
+HUB_DIR="/tmp/cc-hub"
+PID_FILE="/tmp/cc-snap.pid"
+LOG_FILE="/tmp/cc-snap.log"
+
+known_status() {
+    case "${1:-}" in
+        idle|working|approval|done|ended) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+read_pid_file() {
+    local pid
+    [[ -f "$PID_FILE" ]] || return 1
+    pid=$(tr -cd '0-9' < "$PID_FILE" 2>/dev/null || true)
+    [[ -n "$pid" ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+pid_is_watcher() {
+    local pid="${1:-}"
+    local cmd=""
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    [[ -n "$cmd" ]] || return 1
+    [[ "$cmd" == *cc-snap* ]] || return 1
+    [[ "$cmd" == *" --watch"* ]] || return 1
+}
+
+cleanup_pid_file() {
+    local pid=""
+    pid=$(read_pid_file 2>/dev/null || true)
+    if [[ -n "$pid" && "$pid" == "$$" ]]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
+list_watch_pids() {
+    {
+        read_pid_file 2>/dev/null || true
+        pgrep -f 'cc-snap.*--watch' 2>/dev/null || true
+    } | awk 'NF && !seen[$0]++ { print }' | while IFS= read -r pid; do
+        pid_is_watcher "$pid" || continue
+        printf '%s\n' "$pid"
+    done
+    return 0
+}
+
+stop_watchers() {
+    local pid=""
+    local found=0
+    local pass=0
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        found=1
+        kill "$pid" 2>/dev/null || true
+    done < <(list_watch_pids)
+
+    if (( found == 0 )); then
+        rm -f "$PID_FILE"
+        return 1
+    fi
+
+    for (( pass=0; pass<5; pass++ )); do
+        local remaining=""
+        remaining=$(list_watch_pids || true)
+        [[ -z "$remaining" ]] && break
+        sleep 0.2
+    done
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        kill -9 "$pid" 2>/dev/null || true
+    done < <(list_watch_pids)
+
+    rm -f "$PID_FILE"
+    return 0
+}
+
+read_stable_file() {
+    local file="$1"
+    local before="" after="" content=""
+
+    [[ -f "$file" ]] || return 1
+    before=$(wc -c < "$file" 2>/dev/null || true)
+    [[ -n "$before" ]] || return 1
+
+    content=$(cat "$file" 2>/dev/null || true)
+    after=$(wc -c < "$file" 2>/dev/null || true)
+    [[ -n "$after" ]] || return 1
+
+    [[ "$before" == "$after" ]] || return 1
+    [[ -n "$content" ]] || return 1
+    printf '%s' "$content"
+}
+
+status_from_json() {
+    local tty="$1"
+
+    awk -v tty_target="$tty" '
+        {
+            text = text $0 "\n"
+        }
+        END {
+            if (text !~ /^[[:space:]]*{/) exit 1
+            if (text !~ /}[[:space:]]*$/) exit 1
+
+            tty_pat = "\"tty\"[[:space:]]*:[[:space:]]*\""
+            status_pat = "\"status\"[[:space:]]*:[[:space:]]*\""
+
+            if (!match(text, tty_pat)) exit 1
+            rest = substr(text, RSTART + RLENGTH)
+            if (!match(rest, /"/)) exit 1
+            file_tty = substr(rest, 1, RSTART - 1)
+
+            if (!match(text, status_pat)) exit 1
+            rest = substr(text, RSTART + RLENGTH)
+            if (!match(rest, /"/)) exit 1
+            file_status = substr(rest, 1, RSTART - 1)
+
+            if (file_tty != tty_target) exit 1
+            if (file_status !~ /^(idle|working|approval|done|ended)$/) exit 1
+
+            print file_status
+        }
+    ' 2>/dev/null
+}
+
+# ─── Status colors (Terminal.app RGB 0-65535) ────────────────────────────────
+# ─── Cyberpunk palette ───────────────────────────────────────────────────────
+# Deep space blacks. Neon accents. Command center on a starship.
+#
+# Statuses (from Claude Code hooks):
+#   idle     — session started, waiting for first prompt
+#   working  — Claude is thinking or running tools (stays working between tools)
+#   approval — Claude needs you to approve a tool call
+#   done     — Claude finished its turn, waiting for your next message
+#   ended    — session closed
+#
+bg_color() {
+    case "$1" in
+        working)  echo "800,2500,1000" ;;      # faint green glow — alive
+        approval) echo "800,1800,2800" ;;      # faint cyan glow — needs you
+        done)     echo "1500,1500,1800" ;;     # cool gray with hint of blue — cooled down
+        ended)    echo "500,500,500" ;;        # void — unplugged
+        *)        echo "800,1000,800" ;;       # near-black — sleeping
+    esac
+}
+
+fg_color() {
+    case "$1" in
+        working)  echo "0,65535,0" ;;          # BLAZING neon green — Matrix rain
+        approval) echo "0,55000,65535" ;;      # electric cyan — operator needed
+        done)     echo "22000,32000,22000" ;;  # readable soft green — dimmed but legible
+        ended)    echo "4000,4000,4000" ;;     # near-invisible — dead
+        *)        echo "5000,8000,5000" ;;     # ghostly green — barely breathing
+    esac
+}
+
+# Bold text — used for headers, emphasis, code highlights
+bold_color() {
+    case "$1" in
+        working)  echo "20000,65535,35000" ;;  # bright mint — pops against neon green
+        approval) echo "30000,65535,65535" ;;  # white-cyan — bright flash
+        done)     echo "28000,38000,28000" ;;  # slightly brighter green
+        ended)    echo "6000,6000,6000" ;;     # dim
+        *)        echo "8000,14000,8000" ;;    # faint green
+    esac
+}
+
+# Cursor — the blinking heartbeat of each terminal
+cursor_color() {
+    case "$1" in
+        working)  echo "0,65535,0" ;;          # neon green — alive and pulsing
+        approval) echo "0,55000,65535" ;;      # cyan — waiting
+        done)     echo "14000,22000,14000" ;;  # dim green — resting
+        ended)    echo "3000,3000,3000" ;;     # nearly invisible
+        *)        echo "4000,8000,4000" ;;     # faint
+    esac
+}
+
+# ANSI palette — returns AppleScript lines with "of t" ready to go
+ansi_block() {
+    local t="$1"  # "t" variable name used in the AppleScript
+    case "$1" in
+        working)
+            echo "    set ANSI black color of t to {2600,5200,2600}"
+            echo "    set ANSI red color of t to {20000,55000,15000}"
+            echo "    set ANSI green color of t to {0,65535,0}"
+            echo "    set ANSI yellow color of t to {18000,65535,40000}"
+            echo "    set ANSI blue color of t to {10000,45000,25000}"
+            echo "    set ANSI magenta color of t to {15000,55000,55000}"
+            echo "    set ANSI cyan color of t to {0,58000,50000}"
+            echo "    set ANSI white color of t to {40000,65535,45000}"
+            echo "    set ANSI bright black color of t to {8000,16000,8000}"
+            echo "    set ANSI bright red color of t to {30000,65535,25000}"
+            echo "    set ANSI bright green color of t to {15000,65535,15000}"
+            echo "    set ANSI bright yellow color of t to {25000,65535,50000}"
+            echo "    set ANSI bright blue color of t to {15000,55000,35000}"
+            echo "    set ANSI bright magenta color of t to {20000,60000,60000}"
+            echo "    set ANSI bright cyan color of t to {10000,65535,55000}"
+            echo "    set ANSI bright white color of t to {50000,65535,55000}"
+            ;;
+        approval)
+            echo "    set ANSI black color of t to {2600,4000,5200}"
+            echo "    set ANSI red color of t to {15000,45000,55000}"
+            echo "    set ANSI green color of t to {0,50000,55000}"
+            echo "    set ANSI yellow color of t to {20000,60000,65535}"
+            echo "    set ANSI blue color of t to {10000,35000,50000}"
+            echo "    set ANSI magenta color of t to {20000,50000,60000}"
+            echo "    set ANSI cyan color of t to {0,55000,65535}"
+            echo "    set ANSI white color of t to {40000,60000,65535}"
+            echo "    set ANSI bright black color of t to {8000,14000,18000}"
+            echo "    set ANSI bright red color of t to {20000,55000,60000}"
+            echo "    set ANSI bright green color of t to {10000,58000,60000}"
+            echo "    set ANSI bright yellow color of t to {30000,65535,65535}"
+            echo "    set ANSI bright blue color of t to {15000,45000,60000}"
+            echo "    set ANSI bright magenta color of t to {25000,55000,65535}"
+            echo "    set ANSI bright cyan color of t to {15000,60000,65535}"
+            echo "    set ANSI bright white color of t to {50000,65535,65535}"
+            ;;
+        *)
+            echo "    set ANSI black color of t to {3000,4000,3000}"
+            echo "    set ANSI red color of t to {18000,30000,18000}"
+            echo "    set ANSI green color of t to {12000,35000,12000}"
+            echo "    set ANSI yellow color of t to {16000,35000,22000}"
+            echo "    set ANSI blue color of t to {10000,25000,18000}"
+            echo "    set ANSI magenta color of t to {14000,28000,28000}"
+            echo "    set ANSI cyan color of t to {10000,30000,26000}"
+            echo "    set ANSI white color of t to {26000,38000,28000}"
+            echo "    set ANSI bright black color of t to {6000,10000,6000}"
+            echo "    set ANSI bright red color of t to {22000,36000,22000}"
+            echo "    set ANSI bright green color of t to {16000,40000,16000}"
+            echo "    set ANSI bright yellow color of t to {20000,40000,28000}"
+            echo "    set ANSI bright blue color of t to {14000,32000,22000}"
+            echo "    set ANSI bright magenta color of t to {18000,34000,34000}"
+            echo "    set ANSI bright cyan color of t to {14000,36000,30000}"
+            echo "    set ANSI bright white color of t to {30000,42000,32000}"
+            ;;
+    esac
+}
+
+# Smart name: use project dir if meaningful, else short TTY label
+smart_name() {
+    local cwd="$1" tty="$2"
+    local proj
+    proj=$(basename "$cwd")
+    # If cwd is home dir, use TTY-based label instead
+    if [[ "$proj" == "$(whoami)" || "$proj" == "~" || -z "$proj" || "$proj" == "unknown" ]]; then
+        # /dev/ttys009 → "term-9", /dev/ttys013 → "term-13"
+        local tty_num="${tty##*/dev/ttys}"
+        tty_num="${tty_num##*0}"  # strip leading zeros
+        tty_num="${tty_num:-0}"
+        printf 'term-%s' "$tty_num"
+    else
+        printf '%s' "$proj"
+    fi
+}
+
+status_icon() {
+    case "$1" in
+        working)  printf '⚡' ;;
+        approval) printf '❓' ;;
+        done)     printf '✓' ;;
+        ended)    printf '⊘' ;;
+        *)        printf '○' ;;
+    esac
+}
+
+# Look up cwd for a tty from hub json files (newest match)
+get_cwd() {
+    local tty="$1"
+    local f="" content="" best_cwd="" best_ts=0
+
+    for f in "$HUB_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        content=$(read_stable_file "$f") || continue
+
+        # Check if this file matches our tty
+        local file_tty
+        file_tty=$(printf '%s\n' "$content" | awk -F'"' '/"tty"/{print $4}' 2>/dev/null || true)
+        [[ "$file_tty" == "$tty" ]] || continue
+
+        local file_ts
+        file_ts=$(printf '%s\n' "$content" | awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' 2>/dev/null || true)
+        file_ts="${file_ts:-0}"
+
+        if (( file_ts > best_ts )); then
+            best_ts=$file_ts
+            best_cwd=$(printf '%s\n' "$content" | awk -F'"' '/"cwd"/{print $4}' 2>/dev/null || true)
+        fi
+    done
+    printf '%s\n' "${best_cwd:-unknown}"
+}
+
+# ─── Get screen area (respects dock + menu bar) ─────────────────────────────
+get_screen() {
+    local output=""
+    output=$(osascript 2>/dev/null <<'AS'
+use framework "AppKit"
+set s to current application's NSScreen's mainScreen()
+set f to s's frame()
+set v to s's visibleFrame()
+set vx to item 1 of item 1 of v as integer
+set vy to item 2 of item 1 of v as integer
+set vw to item 1 of item 2 of v as integer
+set vh to item 2 of item 2 of v as integer
+set sh to item 2 of item 2 of f as integer
+return (vx as text) & " " & ((sh - vy - vh) as text) & " " & (vw as text) & " " & (vh as text)
+AS
+) || output=""
+    [[ -n "$output" ]] || return 1
+    printf '%s\n' "$output"
+}
+
+# ─── Find Claude Code windows: "id|tty" sorted by id ────────────────────────
+# Returns "id|tty|type" — type is "hub" or "claude"
+find_windows() {
+    local output=""
+    output=$(osascript 2>/dev/null <<'AS'
+set output to ""
+try
+    tell application "Terminal"
+        repeat with w in windows
+            set wName to name of w
+            if wName contains "cc-hub" or wName contains "CC-HUB" then
+                try
+                    set output to output & (id of w as text) & "|" & tty of tab 1 of w & "|hub" & linefeed
+                end try
+            else if wName contains "claude" or wName contains "Claude" then
+                try
+                    set output to output & (id of w as text) & "|" & tty of tab 1 of w & "|claude" & linefeed
+                end try
+            end if
+        end repeat
+    end tell
+end try
+return output
+AS
+) || output=""
+
+    [[ -n "$output" ]] || return 0
+    printf '%s\n' "$output" | awk 'NF' | sort -t'|' -k1,1n
+    return 0
+}
+
+# ─── Look up status for a tty from hub json files ───────────────────────────
+get_status() {
+    local tty="$1"
+    local f="" content="" status=""
+    local best_status="" best_ts=0
+
+    for f in "$HUB_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+
+        content=$(read_stable_file "$f") || continue
+        status=$(printf '%s\n' "$content" | status_from_json "$tty" || true)
+        if [[ -n "$status" ]] && known_status "$status"; then
+            # Extract timestamp and keep the newest match for this TTY
+            local file_ts
+            file_ts=$(printf '%s\n' "$content" | awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' 2>/dev/null || true)
+            file_ts="${file_ts:-0}"
+            if (( file_ts > best_ts )); then
+                best_ts=$file_ts
+                best_status="$status"
+            fi
+        fi
+    done
+    printf '%s\n' "${best_status:-idle}"
+    return 0
+}
+
+# Look up newest timestamp for a tty
+get_status_ts() {
+    local tty="$1"
+    local f="" content="" best_ts=0
+
+    for f in "$HUB_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        content=$(read_stable_file "$f") || continue
+        local file_tty
+        file_tty=$(printf '%s\n' "$content" | awk -F'"' '/"tty"/{print $4}' 2>/dev/null || true)
+        [[ "$file_tty" == "$tty" ]] || continue
+        local file_ts
+        file_ts=$(printf '%s\n' "$content" | awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' 2>/dev/null || true)
+        file_ts="${file_ts:-0}"
+        (( file_ts > best_ts )) && best_ts=$file_ts
+    done
+    printf '%s\n' "$best_ts"
+}
+
+# ─── Grid math: how to divide N windows into rows/cols ───────────────────────
+# Returns "cols rows" — always fills the screen completely.
+grid_for() {
+    local n=$1
+    case "$n" in
+        1) echo "1 1" ;; 2) echo "2 1" ;; 3) echo "2 2" ;;
+        4) echo "2 2" ;; 5) echo "3 2" ;; 6) echo "3 2" ;;
+        7) echo "4 2" ;; 8) echo "4 2" ;; 9) echo "3 3" ;;
+        *) echo "4 3" ;;
+    esac
+}
+
+# ─── Main action: tile + color all windows ───────────────────────────────────
+# Focus-aware layout: focused window breathes larger, others shrink to fit
+
+FOCUS_BOOST_W=0    # disabled — equal grid
+FOCUS_BOOST_H=0    # disabled — equal grid
+FOCUS_MAX_W=50     # unused when boost is 0
+
+# Detect which Terminal window is frontmost
+get_focused_id() {
+    osascript -e 'try
+        tell application "Terminal" to get id of front window
+    end try' 2>/dev/null || echo ""
+}
+
+# Calculate target bounds for all windows, with focus boost for focused_id
+# Outputs: "wid x y x2 y2" per line
+calc_layout() {
+    local focused_id="$1" ox="$2" oy="$3" sw="$4" sh="$5"
+    shift 5
+    local wins=("$@")
+    local n=${#wins[@]}
+    (( n == 0 )) && return 0
+
+    local cols rows
+    read -r cols rows <<< "$(grid_for "$n")"
+
+    local placed=0
+    for (( row=0; row<rows && placed<n; row++ )); do
+        local remaining=$(( n - placed ))
+        local rows_left=$(( rows - row ))
+        local in_row=$(( remaining / rows_left ))
+        (( remaining % rows_left > 0 )) && (( in_row++ ))
+
+        # Check if focused window is in this row
+        local focus_in_row=0 focus_col=-1
+        for (( c=0; c<in_row && (placed+c)<n; c++ )); do
+            local check_wid="${wins[$((placed+c))]%%|*}"
+            if [[ "$check_wid" == "$focused_id" ]]; then
+                focus_in_row=1
+                focus_col=$c
+                break
+            fi
+        done
+
+        # Check if focused window is in this row-block for height
+        local focus_in_row_block=0
+        for (( c=0; c<in_row && (placed+c)<n; c++ )); do
+            local check_wid="${wins[$((placed+c))]%%|*}"
+            [[ "$check_wid" == "$focused_id" ]] && focus_in_row_block=1
+        done
+
+        # Row heights: give focused row a boost
+        local base_h=$(( sh / rows ))
+        local row_y row_h
+        if (( focus_in_row_block && rows > 1 )); then
+            local boost_h=$(( base_h * FOCUS_BOOST_H / 100 ))
+            local shrink_h=$(( boost_h / (rows - 1) ))
+            # Are we in the focused row?
+            row_h=$(( base_h + boost_h ))
+            # Calculate y based on which row and adjustments
+            row_y=$oy
+            for (( pr=0; pr<row; pr++ )); do
+                # Check if previous row had focus
+                local prev_had_focus=0
+                local prev_start=0 prev_in_row=0
+                local pp=0
+                for (( pr2=0; pr2<pr; pr2++ )); do
+                    local pr_rem=$(( n - pp ))
+                    local pr_rl=$(( rows - pr2 ))
+                    local pr_ir=$(( pr_rem / pr_rl ))
+                    (( pr_rem % pr_rl > 0 )) && (( pr_ir++ ))
+                    pp=$(( pp + pr_ir ))
+                done
+                prev_start=$pp
+                local pr_rem2=$(( n - prev_start ))
+                local pr_rl2=$(( rows - pr ))
+                prev_in_row=$(( pr_rem2 / pr_rl2 ))
+                (( pr_rem2 % pr_rl2 > 0 )) && (( prev_in_row++ ))
+                for (( pc=0; pc<prev_in_row; pc++ )); do
+                    local pw="${wins[$((prev_start+pc))]%%|*}"
+                    [[ "$pw" == "$focused_id" ]] && prev_had_focus=1
+                done
+                if (( prev_had_focus )); then
+                    row_y=$(( row_y + base_h + boost_h ))
+                else
+                    row_y=$(( row_y + base_h - shrink_h ))
+                fi
+            done
+        else
+            row_h=$base_h
+            row_y=$(( oy + row * base_h ))
+        fi
+        # Last row snaps to bottom
+        (( row == rows - 1 )) && row_h=$(( oy + sh - row_y ))
+
+        # Column widths: focused gets boost, others shrink
+        local widths=()
+        if (( focus_in_row && in_row > 1 )); then
+            local base_w=$(( sw / in_row ))
+            local boost_w=$(( base_w * FOCUS_BOOST_W / 100 ))
+            local max_w=$(( sw * FOCUS_MAX_W / 100 ))
+            local focus_w=$(( base_w + boost_w ))
+            (( focus_w > max_w )) && focus_w=$max_w
+            local leftover=$(( sw - focus_w ))
+            local other_w=$(( leftover / (in_row - 1) ))
+            for (( c=0; c<in_row; c++ )); do
+                if (( c == focus_col )); then
+                    widths+=("$focus_w")
+                else
+                    widths+=("$other_w")
+                fi
+            done
+        else
+            for (( c=0; c<in_row; c++ )); do
+                widths+=("$(( sw / in_row ))")
+            done
+        fi
+
+        local cum_x=$ox
+        for (( col=0; col<in_row && placed<n; col++ )); do
+            local wid="${wins[$placed]%%|*}"
+            local x=$cum_x
+            local y=$row_y
+            local w="${widths[$col]}"
+            local x2=$(( x + w ))
+            local y2=$(( y + row_h ))
+            # Last col/row snap to edge
+            (( col == in_row - 1 )) && x2=$(( ox + sw ))
+            (( row == rows - 1 )) && y2=$(( oy + sh ))
+            cum_x=$x2
+
+            echo "$wid $x $y $x2 $y2"
+            (( placed++ ))
+        done
+    done
+}
+
+# Full snap: calculate layout with focus boost, apply positions + colors
+do_snap() {
+    local full_style="${1:-false}"
+    local screen
+    screen=$(get_screen) || return 1
+    local ox oy sw sh
+    [[ -n "$screen" ]] || return 1
+    if ! read -r ox oy sw sh <<< "$screen"; then
+        return 1
+    fi
+
+    # Get Claude windows only
+    local claude_wins=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        local wtype="${line##*|}"
+        [[ "$wtype" == "hub" ]] && continue
+        claude_wins+=("$line")
+    done < <(find_windows)
+
+    local n=${#claude_wins[@]}
+    (( n == 0 )) && return 0
+
+    # Get focused window for layout boost
+    local focused_id
+    focused_id=$(get_focused_id)
+
+    # Calculate target layout
+    local layout
+    layout=$(calc_layout "$focused_id" "$ox" "$oy" "$sw" "$sh" "${claude_wins[@]}")
+
+    # Apply positions + colors + titles
+    local as="tell application \"Terminal\""$'\n'
+    local idx=0
+    while IFS=' ' read -r wid tx ty tx2 ty2 || [[ -n "$wid" ]]; do
+        local entry="${claude_wins[$idx]}"
+        local rest="${entry#*|}"
+        local wtty="${rest%%|*}"
+
+        local status
+        status=$(get_status "$wtty" || true)
+        known_status "$status" || status="idle"
+        local bg fg bold curs icon cwd name title
+        bg=$(bg_color "$status")
+        fg=$(fg_color "$status")
+        bold=$(bold_color "$status")
+        curs=$(cursor_color "$status")
+        icon=$(status_icon "$status")
+        cwd=$(get_cwd "$wtty")
+        name=$(smart_name "$cwd" "$wtty")
+        local age=""
+        local sts_ts
+        sts_ts=$(get_status_ts "$wtty")
+        if [[ -n "$sts_ts" && "$sts_ts" != "0" ]]; then
+            local now_ts diff_s
+            now_ts=$(date +%s)
+            diff_s=$(( now_ts - sts_ts ))
+            if (( diff_s < 60 )); then age="${diff_s}s"
+            elif (( diff_s < 3600 )); then age="$(( diff_s / 60 ))m"
+            else age="$(( diff_s / 3600 ))h"
+            fi
+        fi
+        title="${icon} ${name} ${status}${age:+ ${age}}"
+
+        as+="  try"$'\n'
+        as+="    set bounds of window id $wid to {$tx, $ty, $tx2, $ty2}"$'\n'
+        as+="    set t to tab 1 of window id $wid"$'\n'
+        as+="    set background color of t to {$bg}"$'\n'
+        as+="    set normal text color of t to {$fg}"$'\n'
+        as+="    set bold text color of t to {$bold}"$'\n'
+        as+="    set cursor color of t to {$curs}"$'\n'
+        as+="    set custom title of t to \"$title\""$'\n'
+        if [[ "$full_style" == "true" ]]; then
+            as+="    set font name of t to \"Menlo-Regular\""$'\n'
+            as+="    set font size of t to 12"$'\n'
+            as+="$(ansi_block "$status")"$'\n'
+        fi
+        as+="  end try"$'\n'
+        (( idx++ ))
+    done <<< "$layout"
+
+    as+="end tell"
+    osascript -e "$as" 2>/dev/null || true
+    return 0
+}
+
+# ─── Daemon: watch for changes, style continuously ──────────────────────────
+run_daemon() {
+    echo $$ > "$PID_FILE"
+    trap 'cleanup_pid_file; exit 0' INT TERM
+    trap 'cleanup_pid_file' EXIT
+
+    echo "cc-snap running (pid $$)"
+
+    local last_ids=""
+    local tick=0
+    local clean_tick=0
+
+    while true; do
+        # Auto-clean stale files every ~60s (30 cycles × 2s)
+        clean_tick=$(( clean_tick + 1 ))
+        if (( clean_tick >= 30 )); then
+            clean_tick=0
+            for sf in "$HUB_DIR"/*.json; do
+                [[ -f "$sf" ]] || continue
+                local sf_ts
+                sf_ts=$(awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' "$sf" 2>/dev/null || true)
+                sf_ts="${sf_ts:-0}"
+                local sf_status
+                sf_status=$(awk -F'"' '/"status"/{print $4}' "$sf" 2>/dev/null || true)
+                if [[ "$sf_status" == "ended" ]] && (( sf_ts > 0 && $(date +%s) - sf_ts > 300 )); then
+                    rm -f "$sf"
+                fi
+            done
+        fi
+
+        local ids
+        ids=$(find_windows 2>/dev/null | cut -d'|' -f1 | tr '\n' ',') || ids=""
+
+        if [[ -n "$ids" ]]; then
+            if [[ "$ids" != "$last_ids" ]]; then
+                # Windows changed — settle then full style
+                sleep 1
+                local ids2
+                ids2=$(find_windows 2>/dev/null | cut -d'|' -f1 | tr '\n' ',') || ids2=""
+                if [[ "$ids2" == "$ids" ]]; then
+                    echo "[$(date +%H:%M:%S)] reflow"
+                    do_snap true || true
+                    last_ids="$ids"
+                    tick=0
+                fi
+            else
+                # Same windows — snap every tick (focus-aware layout + colors)
+                tick=$(( tick + 1 ))
+                if [[ $tick -ge 1 ]]; then
+                    tick=0
+                    do_snap
+                fi
+            fi
+        else
+            last_ids=""
+            last_statuses=""
+            tick=0
+        fi
+
+        sleep 2
+    done
+}
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+case "${1:-}" in
+    --watch|-w)
+        run_daemon
+        ;;
+    --bg)
+        stop_watchers || true
+        sleep 0.5
+        rm -f "$PID_FILE"
+        nohup "$0" --watch > "$LOG_FILE" 2>&1 &
+        disown || true
+        echo "cc-snap started (pid $!)"
+        ;;
+    --stop)
+        if stop_watchers; then
+            echo "cc-snap stopped"
+        else
+            echo "not running"
+        fi
+        ;;
+    --status)
+        if pid=$(read_pid_file 2>/dev/null) && pid_is_watcher "$pid" && kill -0 "$pid" 2>/dev/null; then
+            echo "running (pid $pid)"
+        else
+            rm -f "$PID_FILE"
+            echo "not running"
+        fi
+        ;;
+    --help|-h)
+        cat <<'EOF'
+cc-snap — Claude Code window manager
+
+  cc-snap           Tile + color once
+  cc-snap --bg      Run in background
+  cc-snap --stop    Stop background daemon
+  cc-snap --status  Check if running
+  cc-snap --watch   Run in foreground (for debugging)
+EOF
+        ;;
+    *)
+        do_snap true && echo "done" || echo "no windows found"
+        ;;
+esac

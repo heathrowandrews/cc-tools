@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# cc-start — Launch the Claude Code command center
+# Opens the hub header + snap daemon, ready for Claude windows.
+
+set -euo pipefail
+
+echo ""
+echo "  \033[1;32m⬡  Starting CC Command Center...\033[0m"
+echo ""
+
+# 1. Stop any existing snap daemon
+cc-snap --stop 2>/dev/null || true
+sleep 0.3
+
+# 2. Clean stale hub files
+cc-hub --clean 2>/dev/null || true
+
+# 3. Open the hub header in a new Terminal window
+osascript -e 'tell application "Terminal" to do script "cc-hub --header"' >/dev/null 2>&1
+
+# 4. Give the hub window a moment to appear
+sleep 1.5
+
+# 5. Start the snap daemon (tiles + colors)
+cc-snap --bg
+
+echo ""
+echo "  \033[1;32m⬡  Command Center is live.\033[0m"
+echo "  \033[90mHub header running. Snap daemon tiling."
+echo "  Open Claude Code in any Terminal window — it auto-joins the grid.\033[0m"
+echo ""

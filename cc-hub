@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# cc-hub — Claude Code session status viewer
+# Status files are written by cc-hub-hook (called from Claude Code hooks).
+# Window tiling and coloring is handled by cc-snap.
+# This script just lets you view status and clean up stale files.
+
+set -euo pipefail
+
+HUB_DIR="/tmp/cc-hub"
+
+print_status() {
+    echo ""
+    echo "  ╭──────────────────────────────────────────────╮"
+    echo "  │        cc-hub — Session Status                │"
+    echo "  ╰──────────────────────────────────────────────╯"
+    echo ""
+
+    local found=0
+    for sf in "$HUB_DIR"/*.json; do
+        [[ -f "$sf" ]] || continue
+        found=1
+
+        local st tt ts
+        st=$(awk -F'"' '/"status"/{print $4}' "$sf" 2>/dev/null)
+        tt=$(awk -F'"' '/"tty"/{print $4}' "$sf" 2>/dev/null)
+        ts=$(awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' "$sf" 2>/dev/null)
+
+        local ago="?"
+        if [[ -n "$ts" ]]; then
+            local now
+            now=$(date +%s)
+            local diff=$(( now - ts ))
+            if (( diff < 60 )); then ago="${diff}s ago"
+            elif (( diff < 3600 )); then ago="$(( diff / 60 ))m ago"
+            else ago="$(( diff / 3600 ))h ago"
+            fi
+        fi
+
+        local icon=""
+        case "$st" in
+            working)  icon="\033[36m⚙\033[0m" ;;
+            approval) icon="\033[35m⚠\033[0m" ;;
+            done)     icon="\033[32m✓\033[0m" ;;
+            idle)     icon="\033[34m●\033[0m" ;;
+            ended)    icon="\033[90m◌\033[0m" ;;
+            *)        icon="?" ;;
+        esac
+
+        printf "  $icon %-10s %-18s %s\n" "$st" "$tt" "$ago"
+    done
+
+    if (( found == 0 )); then
+        echo "  No sessions found."
+    fi
+    echo ""
+}
+
+clean_stale() {
+    local cleaned=0
+    for sf in "$HUB_DIR"/*.json; do
+        [[ -f "$sf" ]] || continue
+        local sf_tty
+        sf_tty=$(awk -F'"' '/"tty"/{print $4}' "$sf" 2>/dev/null)
+        if [[ -n "$sf_tty" && "$sf_tty" != "unknown" && ! -e "$sf_tty" ]]; then
+            rm -f "$sf"
+            (( cleaned++ ))
+        fi
+    done
+    echo "  Cleaned $cleaned stale status files."
+}
+
+live_dashboard() {
+    local refresh="${1:-3}"
+    trap 'tput cnorm; printf "\033[0m"; exit 0' INT TERM
+
+    tput civis  # hide cursor
+
+    while true; do
+        local now
+        now=$(date +%s)
+        local lines=()
+        local working=0 approval=0 done_count=0 idle=0 ended=0
+
+        for sf in "$HUB_DIR"/*.json; do
+            [[ -f "$sf" ]] || continue
+
+            local st tt ts cwd
+            st=$(awk -F'"' '/"status"/{print $4}' "$sf" 2>/dev/null)
+            tt=$(awk -F'"' '/"tty"/{print $4}' "$sf" 2>/dev/null)
+            ts=$(awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' "$sf" 2>/dev/null)
+            cwd=$(awk -F'"' '/"cwd"/{print $4}' "$sf" 2>/dev/null)
+
+            # Skip ended sessions older than 10 min
+            if [[ "$st" == "ended" && -n "$ts" ]] && (( now - ts > 600 )); then
+                continue
+            fi
+
+            local proj
+            proj=$(basename "${cwd:-unknown}")
+
+            local ago="?"
+            if [[ -n "$ts" ]]; then
+                local diff=$(( now - ts ))
+                if (( diff < 60 )); then ago="${diff}s"
+                elif (( diff < 3600 )); then ago="$(( diff / 60 ))m"
+                else ago="$(( diff / 3600 ))h"
+                fi
+            fi
+
+            case "$st" in
+                working)  (( working++ ));    lines+=("  \033[1;32m⚡ WORKING\033[0m  \033[32m${proj}\033[0m  \033[90m${tt}  ${ago}\033[0m") ;;
+                approval) (( approval++ ));   lines+=("  \033[1;36m❓ WAITING\033[0m  \033[36m${proj}\033[0m  \033[90m${tt}  ${ago}\033[0m") ;;
+                done)     (( done_count++ )); lines+=("  \033[0;37m✓  done\033[0m    \033[37m${proj}\033[0m  \033[90m${tt}  ${ago}\033[0m") ;;
+                idle)     (( idle++ ));       lines+=("  \033[0;90m○  idle\033[0m    \033[90m${proj}  ${tt}  ${ago}\033[0m") ;;
+                ended)    (( ended++ ));      lines+=("  \033[0;90m⊘  ended\033[0m   \033[90m${proj}  ${tt}  ${ago}\033[0m") ;;
+            esac
+        done
+
+        local total=$(( working + approval + done_count + idle + ended ))
+
+        # Draw
+        clear
+        echo ""
+        printf "  \033[1;32m╭─────────────────────────────────────────────────╮\033[0m\n"
+        printf "  \033[1;32m│\033[0m         \033[1;32m⬡  CC-HUB  ⬡\033[0m  Mission Control        \033[1;32m│\033[0m\n"
+        printf "  \033[1;32m╰─────────────────────────────────────────────────╯\033[0m\n"
+        echo ""
+
+        # Summary bar
+        local summary="  "
+        (( working > 0 ))    && summary+="\033[1;32m⚡${working} active\033[0m  "
+        (( approval > 0 ))   && summary+="\033[1;36m❓${approval} waiting\033[0m  "
+        (( done_count > 0 )) && summary+="\033[37m✓${done_count} done\033[0m  "
+        (( idle > 0 ))       && summary+="\033[90m○${idle} idle\033[0m  "
+        (( ended > 0 ))      && summary+="\033[90m⊘${ended} ended\033[0m  "
+        printf "$summary\n"
+        printf "  \033[90m─────────────────────────────────────────────────\033[0m\n"
+
+        if [[ ${#lines[@]} -eq 0 ]]; then
+            echo ""
+            printf "  \033[90mNo sessions. Launch Claude Code to begin.\033[0m\n"
+        else
+            for line in "${lines[@]}"; do
+                printf "$line\n"
+            done
+        fi
+
+        echo ""
+        printf "  \033[90m%.0s─\033[0m" {1..49}
+        echo ""
+        printf "  \033[90m${total} sessions  │  refreshing every ${refresh}s  │  ctrl-c to exit\033[0m\n"
+        echo ""
+
+        sleep "$refresh"
+    done
+}
+
+header_dashboard() {
+    local refresh="${1:-2}"
+    trap 'tput cnorm; printf "\033[0m"; exit 0' INT TERM
+    tput civis
+
+    while true; do
+        local now cols
+        now=$(date +%s)
+        cols=$(tput cols 2>/dev/null || echo 120)
+        local sessions=()
+        local working=0 approval=0 done_count=0 idle=0 ended=0
+
+        for sf in "$HUB_DIR"/*.json; do
+            [[ -f "$sf" ]] || continue
+            local st ts cwd
+            st=$(awk -F'"' '/"status"/{print $4}' "$sf" 2>/dev/null)
+            ts=$(awk -F': *' '/"ts"/{gsub(/[^0-9]/,"",$2); print $2}' "$sf" 2>/dev/null)
+            cwd=$(awk -F'"' '/"cwd"/{print $4}' "$sf" 2>/dev/null)
+
+            if [[ "$st" == "ended" && -n "$ts" ]] && (( now - ts > 600 )); then
+                continue
+            fi
+
+            local proj ago="" tt
+            tt=$(awk -F'"' '/"tty"/{print $4}' "$sf" 2>/dev/null)
+            proj=$(basename "${cwd:-?}")
+            # Smart name: if home dir, use TTY label
+            if [[ "$proj" == "$(whoami)" || -z "$proj" || "$proj" == "?" ]]; then
+                local tty_num="${tt##*/dev/ttys}"
+                tty_num="${tty_num##*0}"
+                tty_num="${tty_num:-0}"
+                proj="term-${tty_num}"
+            fi
+            if [[ -n "$ts" ]]; then
+                local diff=$(( now - ts ))
+                if (( diff < 60 )); then ago="${diff}s"
+                elif (( diff < 3600 )); then ago="$(( diff / 60 ))m"
+                else ago="$(( diff / 3600 ))h"
+                fi
+            fi
+
+            case "$st" in
+                working)  (( working++ ));    sessions+=("\033[1;32m⚡${proj} \033[90m${ago}\033[0m") ;;
+                approval) (( approval++ ));   sessions+=("\033[1;36m❓${proj} \033[90m${ago}\033[0m") ;;
+                done)     (( done_count++ )); sessions+=("\033[37m✓${proj} \033[90m${ago}\033[0m") ;;
+                idle)     (( idle++ ));       sessions+=("\033[90m○${proj} ${ago}\033[0m") ;;
+                ended)    (( ended++ )) ;;
+            esac
+        done
+
+        # Single line: title │ sessions │ time
+        printf "\033[H\033[K"
+        local line="\033[1;32m ⬡ CC-HUB\033[0m \033[90m│\033[0m"
+        if [[ ${#sessions[@]} -gt 0 ]]; then
+            for s in "${sessions[@]}"; do
+                line+=" ${s} \033[90m│\033[0m"
+            done
+        else
+            line+=" \033[90mno sessions │\033[0m"
+        fi
+        line+=" \033[90m$(date +%H:%M:%S)\033[0m"
+        printf "${line}\033[K"
+
+        sleep "$refresh"
+    done
+}
+
+case "${1:-}" in
+    --clean|-c)
+        clean_stale
+        ;;
+    --live|-w)
+        mkdir -p "$HUB_DIR"
+        live_dashboard "${2:-3}"
+        ;;
+    --header)
+        mkdir -p "$HUB_DIR"
+        header_dashboard "${2:-2}"
+        ;;
+    --help|-h)
+        cat <<'EOF'
+cc-hub — Claude Code Mission Control
+
+  cc-hub           Show all session statuses
+  cc-hub --header  Compact header bar (for cc-snap layout)
+  cc-hub --live    Full live dashboard (refreshes every 3s)
+  cc-hub --clean   Remove stale status files
+  cc-hub --help    Show this help
+
+Status files: /tmp/cc-hub/*.json
+Written by:   cc-hub-hook (via Claude Code hooks)
+Read by:      cc-snap (for window coloring)
+EOF
+        ;;
+    *)
+        mkdir -p "$HUB_DIR"
+        print_status
+        ;;
+esac

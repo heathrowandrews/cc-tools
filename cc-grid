@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# cc-grid — Claude Code Terminal Grid Manager
+# Launches multiple Claude Code sessions in a gorgeous tmux grid
+
+set -euo pipefail
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+SESSION_NAME="cc-grid"
+PROJECTS_DIR="$HOME/Projects"
+MAX_PANES=6  # 3x2 grid (fits great on a laptop)
+
+# ─── Colors (Catppuccin-inspired palette) ────────────────────────────────────
+C_BG="#1e1e2e"
+C_FG="#cdd6f4"
+C_ACCENT="#cba6f7"    # Mauve
+C_ACTIVE="#a6e3a1"    # Green
+C_BORDER="#585b70"    # Surface2
+C_ACTIVEBORDER="#f5c2e7" # Pink
+C_BAR_BG="#181825"
+C_BAR_FG="#bac2de"
+
+# Pane accent colors for each project slot
+PANE_COLORS=("#f38ba8" "#fab387" "#f9e2af" "#a6e3a1" "#89b4fa" "#cba6f7")
+PANE_LABELS=("🔴" "🟠" "🟡" "🟢" "🔵" "🟣")
+
+# ─── Functions ───────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'USAGE'
+╭──────────────────────────────────────────────────────╮
+│           cc-grid — Claude Code Grid Manager         │
+╰──────────────────────────────────────────────────────╯
+
+USAGE:
+  cc-grid                    Interactive project picker
+  cc-grid <dir1> <dir2> ...  Open specific directories
+  cc-grid --all              Auto-pick recent projects
+  cc-grid --bg               Launch grid in background (no attach)
+  cc-grid --attach           Re-attach to existing grid
+  cc-grid --kill             Tear down the grid session
+  cc-grid --list             List available projects
+  cc-grid --help             Show this help
+
+INSIDE THE GRID:
+  Ctrl-B then arrow keys     Navigate between panes
+  Ctrl-B then z              Zoom/unzoom a pane (fullscreen)
+  Ctrl-B then q              Show pane numbers
+  Ctrl-B then x              Close a pane
+  Ctrl-B then d              Detach (grid keeps running)
+  Ctrl-B then [              Scroll mode (q to exit)
+
+USAGE
+    exit 0
+}
+
+list_projects() {
+    echo ""
+    echo "  Available projects in $PROJECTS_DIR:"
+    echo "  ─────────────────────────────────────"
+    local i=1
+    while IFS= read -r dir; do
+        local name
+        name=$(basename "$dir")
+        local has_git=""
+        [[ -d "$dir/.git" ]] && has_git=" (git)"
+        printf "  %2d. %s%s\n" "$i" "$name" "$has_git"
+        ((i++))
+    done < <(find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+    echo ""
+}
+
+pick_recent_projects() {
+    # Pick the most recently modified project directories (that have .git)
+    local dirs=()
+    while IFS= read -r dir; do
+        dirs+=("$dir")
+    done < <(find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d -exec stat -f '%m %N' {} \; 2>/dev/null \
+        | sort -rn | head -n "$MAX_PANES" | awk '{print $2}')
+
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        echo "No projects found in $PROJECTS_DIR" >&2
+        exit 1
+    fi
+    printf '%s\n' "${dirs[@]}"
+}
+
+interactive_pick() {
+    local all_dirs=()
+    while IFS= read -r dir; do
+        all_dirs+=("$dir")
+    done < <(find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+    if [[ ${#all_dirs[@]} -eq 0 ]]; then
+        echo "No projects found in $PROJECTS_DIR" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "  ╭──────────────────────────────────────────╮"
+    echo "  │     Select projects for the grid         │"
+    echo "  │     (up to $MAX_PANES, space-separated)         │"
+    echo "  ╰──────────────────────────────────────────╯"
+    echo ""
+
+    local i=1
+    for dir in "${all_dirs[@]}"; do
+        local name
+        name=$(basename "$dir")
+        local marker=""
+        [[ -d "$dir/.git" ]] && marker=" ●"
+        printf "  \033[1;35m%2d\033[0m  %s\033[32m%s\033[0m\n" "$i" "$name" "$marker"
+        ((i++))
+    done
+
+    echo ""
+    printf "  Enter numbers (e.g. 1 3 5): "
+    read -r selections
+
+    local chosen=()
+    for num in $selections; do
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#all_dirs[@]} )); then
+            chosen+=("${all_dirs[$((num-1))]}")
+        fi
+    done
+
+    if [[ ${#chosen[@]} -eq 0 ]]; then
+        echo "  No valid selections. Exiting." >&2
+        exit 1
+    fi
+
+    # Cap at MAX_PANES
+    if (( ${#chosen[@]} > MAX_PANES )); then
+        chosen=("${chosen[@]:0:$MAX_PANES}")
+    fi
+
+    printf '%s\n' "${chosen[@]}"
+}
+
+create_grid() {
+    local dirs=("$@")
+    local count=${#dirs[@]}
+
+    if (( count == 0 )); then
+        echo "No directories provided." >&2
+        exit 1
+    fi
+
+    # Kill existing session if any
+    tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+    # Calculate grid dimensions
+    local cols rows
+    if (( count <= 2 )); then
+        cols=2; rows=1
+    elif (( count <= 4 )); then
+        cols=2; rows=2
+    elif (( count <= 6 )); then
+        cols=3; rows=2
+    else
+        cols=3; rows=3
+    fi
+
+    # Create session with first pane
+    local first_dir="${dirs[0]}"
+    local first_name
+    first_name=$(basename "$first_dir")
+
+    tmux new-session -d -s "$SESSION_NAME" -c "$first_dir" -x 200 -y 50
+
+    # Create remaining panes
+    for (( i=1; i<count; i++ )); do
+        tmux split-window -t "$SESSION_NAME" -c "${dirs[$i]}" -h
+        tmux select-layout -t "$SESSION_NAME" tiled
+    done
+
+    # Final tiled layout
+    tmux select-layout -t "$SESSION_NAME" tiled
+
+    # ─── Style the session ─────────────────────────────────────────────────
+
+    # Status bar
+    tmux set-option -t "$SESSION_NAME" status on
+    tmux set-option -t "$SESSION_NAME" status-position top
+    tmux set-option -t "$SESSION_NAME" status-style "bg=$C_BAR_BG,fg=$C_BAR_FG"
+    tmux set-option -t "$SESSION_NAME" status-interval 5
+
+    # Left status: session name
+    tmux set-option -t "$SESSION_NAME" status-left-length 40
+    tmux set-option -t "$SESSION_NAME" status-left "#[bg=$C_ACCENT,fg=#1e1e2e,bold]  CC-GRID #[bg=$C_BAR_BG,fg=$C_ACCENT] "
+
+    # Right status: pane count + time
+    tmux set-option -t "$SESSION_NAME" status-right-length 60
+    tmux set-option -t "$SESSION_NAME" status-right "#[fg=$C_BORDER]│ #[fg=$C_BAR_FG]#{window_panes} panes #[fg=$C_BORDER]│ #[fg=$C_ACTIVE]%H:%M "
+
+    # Window/tab style
+    tmux set-option -t "$SESSION_NAME" window-status-format " #W "
+    tmux set-option -t "$SESSION_NAME" window-status-current-format "#[bg=$C_ACCENT,fg=#1e1e2e,bold] #W "
+
+    # Pane borders
+    tmux set-option -t "$SESSION_NAME" pane-border-style "fg=$C_BORDER"
+    tmux set-option -t "$SESSION_NAME" pane-active-border-style "fg=$C_ACTIVEBORDER,bold"
+    tmux set-option -t "$SESSION_NAME" pane-border-lines heavy
+
+    # Pane border status (shows project name on each pane)
+    tmux set-option -t "$SESSION_NAME" pane-border-status top
+    tmux set-option -t "$SESSION_NAME" pane-border-format \
+        "#[bg=$C_BAR_BG,fg=$C_ACCENT,bold] #{pane_index} #[fg=$C_FG]#{b:pane_current_path} #[fg=$C_BORDER]"
+
+    # Enable mouse for easy pane selection
+    tmux set-option -t "$SESSION_NAME" mouse on
+
+    # Set higher scrollback
+    tmux set-option -t "$SESSION_NAME" history-limit 10000
+
+    # ─── Launch Claude Code in each pane ───────────────────────────────────
+
+    for (( i=0; i<count; i++ )); do
+        local dir="${dirs[$i]}"
+        local name
+        name=$(basename "$dir")
+        local color="${PANE_COLORS[$((i % ${#PANE_COLORS[@]}))]}"
+        local label="${PANE_LABELS[$((i % ${#PANE_LABELS[@]}))]}"
+
+        # Send a clear + banner + claude launch command to each pane
+        tmux send-keys -t "$SESSION_NAME.$i" \
+            "clear && printf '\\033[1;35m━━━ %s %s ━━━\\033[0m\\n' '$label' '$name' && claude" Enter
+    done
+
+    # Select first pane
+    tmux select-pane -t "$SESSION_NAME.0"
+
+    echo ""
+    echo "  ╭────────────────────────────────────────────────────╮"
+    echo "  │          CC-GRID is ready! ${count} panes launched        │"
+    echo "  ╰────────────────────────────────────────────────────╯"
+    echo ""
+    echo "  Projects loaded:"
+    for (( i=0; i<count; i++ )); do
+        echo "    ${PANE_LABELS[$((i % ${#PANE_LABELS[@]}))]}  $(basename "${dirs[$i]}")"
+    done
+    echo ""
+    echo "  Attaching now... (Ctrl-B d to detach)"
+    echo ""
+
+    # Attach
+    tmux attach-session -t "$SESSION_NAME"
+}
+
+create_grid_bg() {
+    # Same as create_grid but doesn't attach — for background launching
+    local dirs=("$@")
+    local count=${#dirs[@]}
+
+    if (( count == 0 )); then
+        echo "No directories provided." >&2
+        exit 1
+    fi
+
+    tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+    local first_dir="${dirs[0]}"
+    tmux new-session -d -s "$SESSION_NAME" -c "$first_dir" -x 200 -y 50
+
+    for (( i=1; i<count; i++ )); do
+        tmux split-window -t "$SESSION_NAME" -c "${dirs[$i]}" -h
+        tmux select-layout -t "$SESSION_NAME" tiled
+    done
+
+    tmux select-layout -t "$SESSION_NAME" tiled
+
+    # Style (same as create_grid)
+    tmux set-option -t "$SESSION_NAME" status on
+    tmux set-option -t "$SESSION_NAME" status-position top
+    tmux set-option -t "$SESSION_NAME" status-style "bg=$C_BAR_BG,fg=$C_BAR_FG"
+    tmux set-option -t "$SESSION_NAME" status-interval 5
+    tmux set-option -t "$SESSION_NAME" status-left-length 40
+    tmux set-option -t "$SESSION_NAME" status-left "#[bg=$C_ACCENT,fg=#1e1e2e,bold]  CC-GRID #[bg=$C_BAR_BG,fg=$C_ACCENT] "
+    tmux set-option -t "$SESSION_NAME" status-right-length 60
+    tmux set-option -t "$SESSION_NAME" status-right "#[fg=$C_BORDER]│ #[fg=$C_BAR_FG]#{window_panes} panes #[fg=$C_BORDER]│ #[fg=$C_ACTIVE]%H:%M "
+    tmux set-option -t "$SESSION_NAME" window-status-format " #W "
+    tmux set-option -t "$SESSION_NAME" window-status-current-format "#[bg=$C_ACCENT,fg=#1e1e2e,bold] #W "
+    tmux set-option -t "$SESSION_NAME" pane-border-style "fg=$C_BORDER"
+    tmux set-option -t "$SESSION_NAME" pane-active-border-style "fg=$C_ACTIVEBORDER,bold"
+    tmux set-option -t "$SESSION_NAME" pane-border-lines heavy
+    tmux set-option -t "$SESSION_NAME" pane-border-status top
+    tmux set-option -t "$SESSION_NAME" pane-border-format \
+        "#[bg=$C_BAR_BG,fg=$C_ACCENT,bold] #{pane_index} #[fg=$C_FG]#{b:pane_current_path} #[fg=$C_BORDER]"
+    tmux set-option -t "$SESSION_NAME" mouse on
+    tmux set-option -t "$SESSION_NAME" history-limit 10000
+
+    # Launch Claude Code in each pane
+    for (( i=0; i<count; i++ )); do
+        local dir="${dirs[$i]}"
+        local name
+        name=$(basename "$dir")
+        local label="${PANE_LABELS[$((i % ${#PANE_LABELS[@]}))]}"
+        tmux send-keys -t "$SESSION_NAME.$i" \
+            "clear && printf '\\033[1;35m━━━ %s %s ━━━\\033[0m\\n' '$label' '$name' && claude" Enter
+    done
+
+    tmux select-pane -t "$SESSION_NAME.0"
+
+    echo ""
+    echo "  ╭────────────────────────────────────────────────────╮"
+    echo "  │     CC-GRID running in background! ${count} panes        │"
+    echo "  ╰────────────────────────────────────────────────────╯"
+    echo ""
+    echo "  Projects loaded:"
+    for (( i=0; i<count; i++ )); do
+        echo "    ${PANE_LABELS[$((i % ${#PANE_LABELS[@]}))]}  $(basename "${dirs[$i]}")"
+    done
+    echo ""
+    echo "  Attach with:  cc-grid --attach"
+    echo ""
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --help|-h)
+        usage
+        ;;
+    --list|-l)
+        list_projects
+        ;;
+    --kill|-k)
+        tmux kill-session -t "$SESSION_NAME" 2>/dev/null && echo "Grid session killed." || echo "No grid session running."
+        ;;
+    --attach|-a)
+        tmux attach-session -t "$SESSION_NAME" 2>/dev/null || echo "No grid session to attach to. Run 'cc-grid' to create one."
+        ;;
+    --all)
+        dirs=()
+        while IFS= read -r d; do dirs+=("$d"); done < <(pick_recent_projects)
+        create_grid "${dirs[@]}"
+        ;;
+    --bg)
+        # Background mode: create grid without attaching
+        dirs=()
+        while IFS= read -r d; do dirs+=("$d"); done < <(pick_recent_projects)
+        create_grid_bg "${dirs[@]}"
+        ;;
+    "")
+        dirs=()
+        while IFS= read -r d; do dirs+=("$d"); done < <(interactive_pick)
+        create_grid "${dirs[@]}"
+        ;;
+    *)
+        # Treat all args as directories
+        validated=()
+        for arg in "$@"; do
+            if [[ -d "$arg" ]]; then
+                validated+=("$(cd "$arg" && pwd)")
+            elif [[ -d "$PROJECTS_DIR/$arg" ]]; then
+                validated+=("$PROJECTS_DIR/$arg")
+            else
+                echo "Warning: '$arg' not found, skipping." >&2
+            fi
+        done
+        if [[ ${#validated[@]} -eq 0 ]]; then
+            echo "No valid directories provided." >&2
+            exit 1
+        fi
+        create_grid "${validated[@]}"
+        ;;
+esac

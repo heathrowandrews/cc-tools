@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# cc-hub-hook — Called by Claude Code hooks to write status files
+# Usage: cc-hub-hook <status>
+# Reads JSON from stdin (provided by Claude Code hooks)
+
+STATUS="${1:-idle}"
+HUB_DIR="/tmp/cc-hub"
+mkdir -p "$HUB_DIR"
+
+# Get TTY for matching to Terminal.app windows
+# Hooks run via pipe so `tty` won't work — walk up the process tree to find
+# the shell that owns a real TTY
+MY_TTY=""
+if [[ -n "${TTY:-}" && "$TTY" != "not a tty" ]]; then
+    MY_TTY="$TTY"
+fi
+if [[ -z "$MY_TTY" ]]; then
+    # Find parent shell's TTY by walking up PIDs
+    check_pid=$$
+    for _ in 1 2 3 4 5; do
+        check_pid=$(ps -o ppid= -p "$check_pid" 2>/dev/null | tr -d ' ')
+        [[ -z "$check_pid" || "$check_pid" == "1" ]] && break
+        found_tty=$(ps -o tty= -p "$check_pid" 2>/dev/null | tr -d ' ')
+        if [[ -n "$found_tty" && "$found_tty" != "??" && "$found_tty" != "-" ]]; then
+            MY_TTY="/dev/$found_tty"
+            break
+        fi
+    done
+fi
+# Last resort: use session_id only (no TTY matching)
+[[ -z "$MY_TTY" ]] && MY_TTY="unknown"
+
+# Extract session_id from stdin JSON, fall back to TTY-based name
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('session_id', ''))
+except:
+    print('')
+" 2>/dev/null)
+
+# Fall back to TTY-based ID if no session_id
+if [[ -z "$SESSION_ID" ]]; then
+    SESSION_ID=$(echo "$MY_TTY" | tr '/' '_')
+fi
+
+# Get working directory
+CWD="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+# Write status file (atomic via temp + mv)
+TMPFILE="$HUB_DIR/.tmp.$$"
+cat > "$TMPFILE" <<EOF
+{
+  "session_id": "$SESSION_ID",
+  "tty": "$MY_TTY",
+  "cwd": "$CWD",
+  "status": "$STATUS",
+  "ts": $(date +%s)
+}
+EOF
+mv -f "$TMPFILE" "$HUB_DIR/${SESSION_ID}.json"
+
+exit 0
